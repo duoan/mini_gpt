@@ -1,0 +1,13 @@
+[project]
+name = "mini-gpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dataclasses>=0.8",
+    "flax>=0.10.2",
+    "jax>=0.5.0",
+    "ml-collections>=1.0.0",
+    "optax>=0.2.4",
+]
