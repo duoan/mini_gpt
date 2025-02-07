@@ -1,18 +1,27 @@
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import jax
 import jax.numpy as jnp
 import optax
 import jax.random as random
 from flax.training import train_state
-import flax.linen as nn
-from regex import T
-from sympy import im
 from model import CausalGPT
-from data import TokenDataset, jnp_collate_fn
+from data import CharTokenizer, TokenDataset, jnp_collate_fn
 from torch.utils.data import DataLoader
 import torch
-import tiktoken
 
 torch.manual_seed(0)
+
+tokenizer = CharTokenizer().load("./tokenizer.json")
+
+# Training setup
+batch_size = 16
+seq_length = 128
+learning_rate = 5e-4
+num_epochs = 10
+log_every = 50
+eval_every = 100
 
 
 def create_train_state(key, model, learning_rate, batch_size, seq_length):
@@ -53,12 +62,10 @@ def evaluate(state, valid_data):
     for step, batch in enumerate(valid_data):
         loss = eval_step(state, batch)
         losses.append(loss)
-        print(f"Evaluation step {step} / {len(valid_data_loader)}, loss: {loss:6f}")
+        if step % 100 == 0:
+            print(f"Evaluation step {step} / {len(valid_data)}, loss: {loss:6f}")
 
-    return jnp.sum(jnp.array(losses))
-
-
-encoding = tiktoken.get_encoding("o200k_base")
+    return jnp.mean(jnp.array(losses))
 
 
 def generate(state, input_ids, max_length=10, seq_length=1024):
@@ -66,27 +73,20 @@ def generate(state, input_ids, max_length=10, seq_length=1024):
         logits = state.apply_fn(state.params, input_ids[:, -seq_length:])
         next_token = jnp.argmax(logits, axis=-1)[:, -1]
         input_ids = jnp.concatenate([input_ids, next_token[:, None]], axis=-1)
-    print("context:\n", encoding.decode(input_ids[0][:seq_length]))
-    print("generate:\n", encoding.decode(input_ids[0][-max_length:]))
+    print("context:\n", tokenizer.decode(input_ids[0][:seq_length]))
+    print("generate:\n", tokenizer.decode(input_ids[0][-max_length:]))
 
-
-# Training setup
-batch_size = 2
-seq_length = 128
-learning_rate = 5e-4
-num_epochs = 10
-log_every = 10
-eval_every = 10
 
 # Initialize model and state
 key = random.PRNGKey(0)
 model = CausalGPT(
-    vocab_size=200019,
-    embed_dim=768,
-    num_heads=8,
-    num_layers=2,
+    vocab_size=tokenizer.vocab_size(),
+    embed_dim=512,
+    num_heads=4,
+    num_layers=4,
     mlp_dim=128,
     dropout=0.1,
+    dtype=jnp.float32,
 )
 
 state = create_train_state(key, model, learning_rate, batch_size, seq_length)
@@ -125,13 +125,14 @@ for epoch in range(num_epochs):
                 f"Train Loss:{train_loss:6f}"
             )
             generate(state, batch[0], seq_length=seq_length)
-        # if (1 + global_step) % eval_every == 0:
-        #     eval_loss = evaluate(state, valid_data_loader)
-        #     print(
-        #         f"Training epoch:{epoch} / {num_epochs}, "
-        #         f"Step:{global_step:,}/ {total_steps}, "
-        #         f"Train Loss:{train_loss:6f}"
-        #         f"Eval Loss:{eval_loss:6f}"
-        #     )
+
+        if (1 + global_step) % eval_every == 0:
+            eval_loss = evaluate(state, valid_data_loader)
+            print(
+                f"Training epoch:{epoch} / {num_epochs}, "
+                f"Step:{global_step:,}/ {total_steps}, "
+                f"Train Loss:{train_loss:6f}"
+                f"Eval Loss:{eval_loss:6f}"
+            )
 
 print("Training completed!")
