@@ -1,7 +1,5 @@
 import os
 
-from sympy import im
-
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import jax
 import jax.numpy as jnp
@@ -10,15 +8,13 @@ import optax
 import jax.random as random
 from flax.training import train_state
 from model import CausalGPT
-from data import TokenDataset, jnp_collate_fn
-from generate import generate_text, generate_from_batch
+from data import CharTokenizer, TokenDataset, jnp_collate_fn
 from torch.utils.data import DataLoader
 import torch
-import tiktoken
 
 torch.manual_seed(0)
 
-encoding = tiktoken.get_encoding("o200k_base")
+tokenizer = CharTokenizer().load("./tokenizer.json")
 
 
 class TrainState(train_state.TrainState):
@@ -74,8 +70,8 @@ def generate(state, input_ids, max_length=10, seq_length=1024):
         logits = state.apply_fn(state.params, input_ids[:, -seq_length:])
         next_token = jnp.argmax(logits, axis=-1)[:, -1]
         input_ids = jnp.concatenate([input_ids, next_token[:, None]], axis=-1)
-    print("context:\n", encoding.decode(input_ids[0][:seq_length]))
-    print("generate:\n", encoding.decode(input_ids[0][-max_length:]))
+    print("context:\n", tokenizer.decode(input_ids[0][:seq_length]))
+    print("generate:\n", tokenizer.decode(input_ids[0][-max_length:]))
 
 
 class DataParallelTrainer:
@@ -131,7 +127,7 @@ class DataParallelTrainer:
             self.state, train_loss = self.p_train_step(self.state, p_ids, p_labels)
             train_loss = jnp.mean(train_loss)
             if step % self.log_every == 0:
-                print(f"Step {step}, Train Loss: {train_loss:.4f}")
+                print(f"Step {step}, Train Loss: {train_loss}")
 
             if eval_data is not None and step % self.eval_every == 0:
                 eval_losses = []
@@ -140,34 +136,12 @@ class DataParallelTrainer:
                     eval_loss = self.p_eval_step(self.state, p_ids, p_labels)
                     eval_losses.append(jnp.mean(eval_loss))
                 eval_loss = jnp.mean(jnp.array(eval_losses))
-                print(
-                    f"Step {step}, Train Loss: {train_loss:.4f}, Eval Loss: {eval_loss:.4f}"
-                )
-
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 0.9,
-    ):
-        """Generate text using the trained model"""
-        return generate_text(
-            self.state,
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            seq_length=self.seq_length,
-            encoding=encoding,  # 使用全局的encoding
-        )
+                print(f"Step {step}, Train Loss: {train_loss}, Eval Loss: {eval_loss}")
 
 
 if __name__ == "__main__":
     model = CausalGPT(
-        vocab_size=encoding.n_vocab,
+        vocab_size=tokenizer.vocab_size(),
         embed_dim=768,
         num_heads=16,
         num_layers=4,
