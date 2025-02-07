@@ -8,6 +8,7 @@ import jax.random as random
 from flax.training import train_state
 from model import CausalGPT
 from data import CharTokenizer, TokenDataset, jnp_collate_fn
+from summary import print_model_summary
 from torch.utils.data import DataLoader
 import torch
 
@@ -26,6 +27,7 @@ eval_every = 100
 
 def create_train_state(key, model, learning_rate, batch_size, seq_length):
     input_shape = (batch_size, seq_length)
+    print_model_summary(model, (seq_length,), batch_size, True)
     params = model.init(key, jnp.ones(input_shape, dtype=jnp.int32))
     tx = optax.adam(learning_rate)
     return train_state.TrainState.create(
@@ -90,6 +92,7 @@ model = CausalGPT(
 )
 
 state = create_train_state(key, model, learning_rate, batch_size, seq_length)
+
 
 # Generate dummy data for testing
 key, train_key, eval_key = random.split(key, 3)
