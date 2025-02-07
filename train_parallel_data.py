@@ -1,3 +1,8 @@
+import os
+
+from sympy import im
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -5,6 +10,15 @@ import optax
 import jax.random as random
 from flax.training import train_state
 from model import CausalGPT
+from data import TokenDataset, jnp_collate_fn
+from generate import generate_text, generate_from_batch
+from torch.utils.data import DataLoader
+import torch
+import tiktoken
+
+torch.manual_seed(0)
+
+encoding = tiktoken.get_encoding("o200k_base")
 
 
 class TrainState(train_state.TrainState):
@@ -25,18 +39,18 @@ def create_train_state(key, model, learning_rate, batch_size, seq_length, num_de
 
 
 @jax.jit
-def train_step_pmap(state, batch):
+def train_step_pmap(state, ids, labels):
     key, dropout_key = random.split(state.key)
 
     def loss_fn(params):
         logits = state.apply_fn(
             {"params": params},
-            batch,
+            ids,
             deterministic=False,
             rngs={"dropout": dropout_key},
         )
-        loss = jnp.mean(jnp.square(logits))
-        return loss
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+        return jnp.mean(loss)
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     state = state.apply_gradients(grads=grads)
@@ -45,14 +59,23 @@ def train_step_pmap(state, batch):
 
 
 @jax.jit
-def eval_step_pmap(state, batch):
+def eval_step_pmap(state, ids, labels):
     logits = state.apply_fn(
         {"params": state.params},
-        batch,
+        ids,
         deterministic=True,
     )
-    loss = jnp.mean(jnp.square(logits))
-    return loss
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    return jnp.mean(loss)
+
+
+def generate(state, input_ids, max_length=10, seq_length=1024):
+    for _ in range(max_length):
+        logits = state.apply_fn(state.params, input_ids[:, -seq_length:])
+        next_token = jnp.argmax(logits, axis=-1)[:, -1]
+        input_ids = jnp.concatenate([input_ids, next_token[:, None]], axis=-1)
+    print("context:\n", encoding.decode(input_ids[0][:seq_length]))
+    print("generate:\n", encoding.decode(input_ids[0][-max_length:]))
 
 
 class DataParallelTrainer:
@@ -71,12 +94,14 @@ class DataParallelTrainer:
         seq_length: int,
         learning_rate: float = 1e-3,
         num_epochs: int = 10,
+        log_every: int = 10,
         eval_every: int = 100,
     ):
         self.model = model
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.num_epochs = num_epochs
+        self.log_every = log_every
         self.eval_every = eval_every
 
         self.num_devices = jax.device_count()
@@ -94,53 +119,89 @@ class DataParallelTrainer:
         self.p_eval_step = jax.pmap(eval_step_pmap, axis_name="batch")
         self.state = jax.device_put_replicated(self.state, jax.devices())
 
-    def _prepare_batch(self, batch):
-        return batch.reshape(self.num_devices, self.device_batch_size, self.seq_length)
+    def _prepare_batch(self, ids, labels):
+        return (
+            ids.reshape(self.num_devices, self.device_batch_size, self.seq_length),
+            labels.reshape(self.num_devices, self.device_batch_size, self.seq_length),
+        )
 
     def train_epoch(self, train_data, eval_data=None):
-        for step, batch in enumerate(train_data):
-            p_batch = self._prepare_batch(batch)
-            self.state, train_loss = self.p_train_step(self.state, p_batch)
+        for step, (ids, labels) in enumerate(train_data):
+            p_ids, p_labels = self._prepare_batch(ids, labels)
+            self.state, train_loss = self.p_train_step(self.state, p_ids, p_labels)
             train_loss = jnp.mean(train_loss)
+            if step % self.log_every == 0:
+                print(f"Step {step}, Train Loss: {train_loss:.4f}")
 
             if eval_data is not None and step % self.eval_every == 0:
                 eval_losses = []
-                for eval_batch in eval_data:
-                    p_eval_batch = self._prepare_batch(eval_batch)
-                    eval_loss = self.p_eval_step(self.state, p_eval_batch)
+                for ids, labels in eval_data:
+                    p_ids, p_labels = self._prepare_batch(ids, labels)
+                    eval_loss = self.p_eval_step(self.state, p_ids, p_labels)
                     eval_losses.append(jnp.mean(eval_loss))
                 eval_loss = jnp.mean(jnp.array(eval_losses))
                 print(
                     f"Step {step}, Train Loss: {train_loss:.4f}, Eval Loss: {eval_loss:.4f}"
                 )
 
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9,
+    ):
+        """Generate text using the trained model"""
+        return generate_text(
+            self.state,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seq_length=self.seq_length,
+            encoding=encoding,  # 使用全局的encoding
+        )
+
 
 if __name__ == "__main__":
     model = CausalGPT(
-        vocab_size=50257,
+        vocab_size=encoding.n_vocab,
         embed_dim=768,
-        num_heads=12,
-        num_layers=12,
-        mlp_dim=3072,
+        num_heads=16,
+        num_layers=4,
+        mlp_dim=512,
         dropout=0.1,
+        dtype=jnp.bfloat16,
     )
 
-    batch_size = 32
-    seq_length = 128
+    batch_size = jax.device_count() * 4
+    seq_length = 512
     trainer = DataParallelTrainer(
         model=model,
         batch_size=batch_size,
         seq_length=seq_length,
     )
 
-    key = random.PRNGKey(0)
-    train_data = [
-        random.randint(key, (batch_size, seq_length), 0, 50257) for _ in range(10)
-    ]
-    eval_data = [
-        random.randint(key, (batch_size, seq_length), 0, 50257) for _ in range(2)
-    ]
+    train_data_loader = DataLoader(
+        TokenDataset("tokens_train.npy", seq_length),
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=jnp_collate_fn,
+    )
+
+    print(f"train_data_loader size: {len(train_data_loader):,}")
+
+    valid_data_loader = DataLoader(
+        TokenDataset("tokens_valid.npy", seq_length),
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=jnp_collate_fn,
+    )
+
+    print(f"valid_data_loader size: {len(valid_data_loader):,}")
 
     for epoch in range(trainer.num_epochs):
         print(f"Epoch {epoch}")
-        trainer.train_epoch(train_data, eval_data)
+        trainer.train_epoch(train_data_loader, valid_data_loader)
