@@ -107,10 +107,25 @@ def evaluate(state, valid_data):
     return jnp.mean(jnp.array(losses))
 
 
-def generate(state, input_ids, max_length=10, seq_length=1024):
+def generate_token(model, params, input_ids, rng):
+    # TODO, using cache
+    # Only process the last token in the sequence
+    last_input_ids = input_ids[:, -1:]
+    logits = model.apply(
+        params,
+        last_input_ids,  # Only the last token
+        deterministic=False,
+        rngs={"dropout": rng},
+    )
+    next_token = jnp.argmax(logits[:, -1, :], axis=-1)
+    return next_token
+
+
+def generate(model, params, input_ids, max_length=100, seq_length=1024):
+    rng = jax.random.PRNGKey(0)
+
     for _ in range(max_length):
-        logits = state.apply_fn(state.params, input_ids[:, -seq_length:])
-        next_token = jnp.argmax(logits, axis=-1)[:, -1]
+        next_token = generate_token(model, params, input_ids, rng)
         input_ids = jnp.concatenate([input_ids, next_token[:, None]], axis=-1)
     context = tokenizer.decode(input_ids[0][:seq_length])
     response = tokenizer.decode(input_ids[0][-max_length:])
@@ -135,7 +150,6 @@ model = CausalGPT(
 state = create_train_state(
     key, model, config.learning_rate, config.batch_size, config.seq_length
 )
-
 
 # Generate dummy data for testing
 key, train_key, eval_key = random.split(key, 3)
@@ -170,7 +184,7 @@ for epoch in range(config.num_epochs):
                 f"Step:{global_step:,}/ {total_steps}, "
                 f"Train Loss:{train_loss}"
             )
-            generate(state, batch[0], seq_length=config.seq_length)
+            generate(model, state.params, batch[0], seq_length=config.seq_length)
 
         if (1 + global_step) % config.eval_every == 0:
             eval_loss = evaluate(state, valid_data_loader)

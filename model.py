@@ -1,7 +1,10 @@
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any
 from flax.typing import Dtype
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def get_relative_positions(seq_len: int):
@@ -40,8 +43,9 @@ class CausalSelfAttention(nn.Module):
         )
         self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x, mask, deterministic: bool = True):
+    def __call__(self, x, mask, deterministic: bool = True, rngs=None):
         batch_size, seq_len, embed_dim = x.shape
+        dropout_rng = rngs["dropout"] if rngs else None
         head_dim = embed_dim // self.num_heads
         qkv = self.qkv_proj(x)
         qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, head_dim)
@@ -61,7 +65,11 @@ class CausalSelfAttention(nn.Module):
 
         attn_weights = jnp.where(mask, attn_weights, -1e9)
         attn_weights = nn.softmax(attn_weights, axis=-1)
-        attn_weights = self.dropout_layer(attn_weights, deterministic=deterministic)
+        attn_weights = self.dropout_layer(
+            attn_weights,
+            deterministic=deterministic,
+            rng=dropout_rng,
+        )
 
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, v)
         attn_output = attn_output.reshape(batch_size, seq_len, embed_dim)
@@ -99,15 +107,22 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype)
         self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x, mask, deterministic: bool = True):
-        attn_out = self.attn(self.norm1(x), mask, deterministic=deterministic)
-        x = x + self.dropout_layer(attn_out, deterministic=deterministic)
+    def __call__(self, x, mask, deterministic: bool = True, rngs=None):
+        dropout_rng = rngs["dropout"] if rngs else None
+        attn_out = self.attn(
+            self.norm1(x), mask, deterministic=deterministic, rngs=rngs
+        )
+        x = x + self.dropout_layer(
+            attn_out, deterministic=deterministic, rng=dropout_rng
+        )
         hidden = self.fc1(self.norm2(x))
         hidden = self.activation(hidden)
-        hidden = self.dropout1(hidden, deterministic=deterministic)
+        hidden = self.dropout1(hidden, deterministic=deterministic, rng=dropout_rng)
         hidden = self.fc2(hidden)
-        mlp_out = self.dropout2(hidden, deterministic=deterministic)
-        x = x + self.dropout_layer(mlp_out, deterministic=deterministic)
+        mlp_out = self.dropout2(hidden, deterministic=deterministic, rng=dropout_rng)
+        x = x + self.dropout_layer(
+            mlp_out, deterministic=deterministic, rng=dropout_rng
+        )
         return x
 
 
@@ -120,7 +135,7 @@ class CausalGPT(nn.Module):
     max_seq_len: int = 1024
     dropout_rate: float = 0.1
     alibi_bias: bool = True
-    dtype: Dtype | None = (None,)
+    dtype: Dtype | None = None
     param_dtype: Dtype = jnp.float32
 
     def setup(self):
@@ -157,17 +172,18 @@ class CausalGPT(nn.Module):
         )
         self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, input_ids, deterministic: bool = True):
+    def __call__(self, input_ids, deterministic: bool = True, rngs=None):
         batch_size, seq_len = input_ids.shape
+        dropout_rng = rngs["dropout"] if rngs else None
 
         mask = jnp.tril(jnp.ones((seq_len, seq_len)))
         x = self.token_embed(input_ids)
         if not self.alibi_bias:
             x += self.pos_embed(jnp.arange(seq_len))
-        x = self.dropout_layer(x, deterministic=deterministic)
+        x = self.dropout_layer(x, deterministic=deterministic, rng=dropout_rng)
 
         for block in self.blocks:
-            x = block(x, mask, deterministic=deterministic)
+            x = block(x, mask, deterministic=deterministic, rngs=rngs)
 
         x = self.ln_f(x)
         return self.out_proj(x)

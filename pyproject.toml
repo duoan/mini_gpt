@@ -19,3 +19,4 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jax[cuda12]>=0.5.0"] 
+mac = ["jax-metal>=0.1.1"]
