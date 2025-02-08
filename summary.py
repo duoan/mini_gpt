@@ -3,6 +3,9 @@ import jax.numpy as jnp
 from typing import Any, Dict, List, Tuple, Union
 from dataclasses import dataclass
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -99,18 +102,18 @@ def print_model_summary(
     total_params = param_count["total"]
 
     # 打印摘要
-    print("\nModel Summary:")
-    print("=" * 80)
-    print(
+    logger.info("Model Summary:")
+    logger.info("=" * 80)
+    logger.info(
         f"{'Layer':<40} {'Type':<20} {'Params':<10} {'Shape' if show_param_shapes else ''}"
     )
-    print("-" * 80)
+    logger.info("-" * 80)
 
     def print_module(path: str, level: int = 0):
         info = module_dict[path]
         indent = "  " * level
         shape_str = f"{info.shape}" if show_param_shapes and info.shape else ""
-        print(
+        logger.info(
             f"{indent}{info.name:<{40-level*2}} {info.type:<20} {format_size(info.params):<10} {shape_str}"
         )
 
@@ -123,9 +126,9 @@ def print_model_summary(
         print_module(root)
 
     # 打印总结
-    print("=" * 80)
-    print(f"Total params: {format_size(total_params)} ({total_params:,})")
-    print(f"Input shape: {input_shapes}")
+    logger.info("=" * 80)
+    logger.info(f"Total params: {format_size(total_params)} ({total_params:,})")
+    logger.info(f"Input shape: {input_shapes}")
     if hasattr(model, "dtype"):
-        print(f"Model dtype: {model.dtype}")
-    print("=" * 80)
+        logger.info(f"Model dtype: {model.dtype}")
+    logger.info("=" * 80)

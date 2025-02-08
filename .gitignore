@@ -13,3 +13,4 @@ wheels/
 tokens.txt
 *.npy
 tokenizer.json
+*.log

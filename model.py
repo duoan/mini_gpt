@@ -1,9 +1,10 @@
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Any
+from flax.typing import Dtype
 
 
-def get_relative_positions(seq_len: int, dtype: Any = jnp.float32):
+def get_relative_positions(seq_len: int):
     x = jnp.arange(seq_len)[None, :]
     y = jnp.arange(seq_len)[:, None]
     return x - y
@@ -25,31 +26,33 @@ def get_alibi_slope(num_heads):
 class CausalSelfAttention(nn.Module):
     embed_dim: int
     num_heads: int
-    dropout: float = 0.1
-    dtype: Any = jnp.float32
-    alibi_bias = True
+    dropout_rate: float = 0.1
+    alibi_bias: bool = False
+    dtype: Dtype | None = None
+    param_dtype: Dtype = jnp.float32
 
     def setup(self):
-        self.qkv_proj = nn.Dense(3 * self.embed_dim, dtype=self.dtype)
-        self.out_proj = nn.Dense(self.embed_dim, dtype=self.dtype)
-        self.dropout_layer = nn.Dropout(rate=self.dropout)
+        self.qkv_proj = nn.Dense(
+            3 * self.embed_dim, dtype=self.dtype, param_dtype=self.param_dtype
+        )
+        self.out_proj = nn.Dense(
+            self.embed_dim, dtype=self.dtype, param_dtype=self.param_dtype
+        )
+        self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, mask, deterministic: bool = True):
         batch_size, seq_len, embed_dim = x.shape
+        head_dim = embed_dim // self.num_heads
         qkv = self.qkv_proj(x)
-        qkv = qkv.reshape(
-            batch_size, seq_len, 3, self.num_heads, embed_dim // self.num_heads
-        )
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, head_dim)
         q, k, v = jnp.split(qkv, 3, axis=2)
         q, k, v = q.squeeze(2), k.squeeze(2), v.squeeze(2)
 
-        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(
-            embed_dim // self.num_heads
-        )
+        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(head_dim)
 
         if self.alibi_bias:
             # Get relative positions (for alibi bias)
-            relative_positions = get_relative_positions(seq_len, dtype=self.dtype)
+            relative_positions = get_relative_positions(seq_len)
             # Create alibi bias based on the relative positions
             alibi_slope = get_alibi_slope(self.num_heads)
             alibi_bias = alibi_slope * relative_positions
@@ -60,7 +63,7 @@ class CausalSelfAttention(nn.Module):
         attn_weights = nn.softmax(attn_weights, axis=-1)
         attn_weights = self.dropout_layer(attn_weights, deterministic=deterministic)
 
-        attn_output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, v)
         attn_output = attn_output.reshape(batch_size, seq_len, embed_dim)
         return self.out_proj(attn_output)
 
@@ -69,21 +72,32 @@ class TransformerBlock(nn.Module):
     embed_dim: int
     num_heads: int
     mlp_dim: int
-    dropout: float = 0.1
-    dtype: Any = jnp.float32
+    dropout_rate: float = 0.1
+    alibi_bias: bool = False
+    dtype: Dtype | None = None
+    param_dtype: Dtype = jnp.float32
 
     def setup(self):
         self.attn = CausalSelfAttention(
-            self.embed_dim, self.num_heads, self.dropout, self.dtype
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            dropout_rate=self.dropout_rate,
+            alibi_bias=self.alibi_bias,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
-        self.fc1 = nn.Dense(self.mlp_dim, dtype=self.dtype)
+        self.fc1 = nn.Dense(
+            self.mlp_dim, dtype=self.dtype, param_dtype=self.param_dtype
+        )
         self.activation = nn.gelu
-        self.dropout1 = nn.Dropout(rate=self.dropout)
-        self.fc2 = nn.Dense(self.embed_dim, dtype=self.dtype)
-        self.dropout2 = nn.Dropout(rate=self.dropout)
-        self.norm1 = nn.LayerNorm(dtype=self.dtype)
-        self.norm2 = nn.LayerNorm(dtype=self.dtype)
-        self.dropout_layer = nn.Dropout(rate=self.dropout)
+        self.dropout1 = nn.Dropout(rate=self.dropout_rate)
+        self.fc2 = nn.Dense(
+            self.embed_dim, dtype=self.dtype, param_dtype=self.param_dtype
+        )
+        self.dropout2 = nn.Dropout(rate=self.dropout_rate)
+        self.norm1 = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype)
+        self.norm2 = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype)
+        self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, mask, deterministic: bool = True):
         attn_out = self.attn(self.norm1(x), mask, deterministic=deterministic)
@@ -104,27 +118,44 @@ class CausalGPT(nn.Module):
     num_layers: int
     mlp_dim: int
     max_seq_len: int = 1024
-    dropout: float = 0.1
-    dtype: Any = jnp.float32
+    dropout_rate: float = 0.1
     alibi_bias: bool = True
+    dtype: Dtype | None = (None,)
+    param_dtype: Dtype = jnp.float32
 
     def setup(self):
-        self.token_embed = nn.Embed(self.vocab_size, self.embed_dim, dtype=self.dtype)
+        self.token_embed = nn.Embed(
+            self.vocab_size,
+            self.embed_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
         if not self.alibi_bias:
-            # 使用可学习的位置编码
+            # A learned embedding
             self.pos_embed = nn.Embed(
-                self.max_seq_len, self.embed_dim, dtype=self.dtype
+                self.max_seq_len,
+                self.embed_dim,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )
 
         self.blocks = [
             TransformerBlock(
-                self.embed_dim, self.num_heads, self.mlp_dim, self.dropout, self.dtype
+                embed_dim=self.embed_dim,
+                num_heads=self.num_heads,
+                mlp_dim=self.mlp_dim,
+                alibi_bias=self.alibi_bias,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
             )
             for _ in range(self.num_layers)
         ]
-        self.ln_f = nn.LayerNorm(dtype=self.dtype)
-        self.out_proj = nn.Dense(self.vocab_size, dtype=self.dtype)
-        self.dropout_layer = nn.Dropout(rate=self.dropout)
+        self.ln_f = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype)
+        self.out_proj = nn.Dense(
+            self.vocab_size, dtype=self.dtype, param_dtype=self.param_dtype
+        )
+        self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, input_ids, deterministic: bool = True):
         batch_size, seq_len = input_ids.shape
